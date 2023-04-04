@@ -114,6 +114,7 @@ void ParallelLeiden::flattenPartition() {
     TRACE("Flattening partition took " + timer.elapsedTag());
 }
 
+
 void ParallelLeiden::parallelMove(const Graph &graph) {
     DEBUG("Local Moving : ", graph.numberOfNodes(), " Nodes ");
     std::vector<count> moved(omp_get_max_threads(), 0);
@@ -122,7 +123,7 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
     //^^^ Debug stuff
 
     // Only insert nodes to the queue when they're not already in it.
-    std::vector<std::atomic_bool> inQueue(graph.upperNodeIdBound());
+    std::vector<std::atomic_bool> inQueue(graph.upperNodeIdBound()); // This is the "highest" node value in the graph
     std::queue<std::vector<node>> queue;
     std::mutex qlock;                      // queue lock
     std::condition_variable workAvailable; // waiting/notifying for new Nodes
@@ -131,52 +132,56 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
     std::atomic_int waitingForResize(0);
     std::atomic_int waitingForNodes(0);
 
-    std::vector<int> order;
+    std::vector<int> order; // TODO Ariel What does this do?
     int tshare;
     int tcount;
     uint64_t vectorSize = communityVolumes.capacity();
     std::atomic_int upperBound(result.upperBound());
 #pragma omp parallel
     {
-#pragma omp single
+        #pragma omp single
         {
             tcount = omp_get_num_threads();
-            order.resize(tcount);
+            order.resize(tcount); // Ariel-Resize vector to len(nr_threads). Undefined so far
             for (int i = 0; i < tcount; i++) {
                 order[i] = i;
             }
             if (random)
                 std::shuffle(order.begin(), order.end(), Aux::Random::getURNG());
+            // Calculate # nodes for each thread to process
+            // If n_threads=1, this should equal nr. nodes in graph
             tshare = 1 + graph.upperNodeIdBound() / tcount;
         }
         auto &mt = Aux::Random::getURNG();
         std::vector<node> currentNodes;
-        currentNodes.reserve(tshare);
+        currentNodes.reserve(tshare); // "Steal" work - nodes to process
         std::vector<node> newNodes;
-        newNodes.reserve(WORKING_SIZE);
+        newNodes.reserve(WORKING_SIZE); // TODO Ariel Why 2 such vectors?
         // cutWeight[Community] returns cut of Node to Community
+        // Ariel-Weight across cut with each other community. Obviously vector is len(nr.communities)
         std::vector<double> cutWeights(communityVolumes.capacity());
         std::vector<index> pointers;
         int start = tshare * order[omp_get_thread_num()];
         int end = (1 + order[omp_get_thread_num()]) * tshare;
 
         for (int i = start; i < end; i++) {
-            if (graph.hasNode(i)) {
-                currentNodes.push_back(i);
-                std::atomic_init(&inQueue[i], true);
+            if (graph.hasNode(i)) { // Ariel-They use Node # upper bound, so not all integers < upperBound may be legit nodes?
+                currentNodes.push_back(i); // Ariel-Add work for current Thread
+                std::atomic_init(&inQueue[i], true); // Ariel-Atomic-update queue?
             }
         }
         if (random)
             std::shuffle(currentNodes.begin(), currentNodes.end(), mt);
-#pragma omp barrier
+#pragma omp barrier // TODO Ariel What communication happens before this barrier? Why is this needed here?
         do {
             handler.assureRunning();
             for (node u : currentNodes) {
+                // TODO Ariel understand this
                 // If a vector resize is needed, yield until done (This will probably never happen)
                 // The causing thread will do so once waitingForResize == tcount (Amount of threads)
-                if (resize) {
+                if (resize) { // TODO Ariel Who changes this resize flag? Is it 142-154?
                     waitingForResize++;
-                    while (resize) {
+                    while (resize) { // TODO Ariel understand this
                         std::this_thread::yield();
                     }
                     waitingForResize--;
@@ -184,37 +189,44 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
                 cutWeights.resize(vectorSize);
                 assert(inQueue[u]);
                 index currentCommunity = result[u];
-                double maxDelta = std::numeric_limits<double>::lowest();
-                index bestCommunity = none;
-                double degree = 0;
-                for (auto z : pointers) {
+                double maxDelta = std::numeric_limits<double>::lowest(); // This is the Max in Pseudocode::17
+                index bestCommunity = none; // Argmax of above
+                double degree = 0; // TODO Ariel-?? Node degree?
+                for (auto z : pointers) { // TODO Ariel-Reset CutWeights. Why? Are communities changing?
                     // Reset the clearlist : Set all cutweights to 0 and clear the pointer vector
                     cutWeights[z] = 0;
                 }
                 pointers.clear();
 
+                // TODO Ariel - This Lambda fn. is the most expensive part based on my profiling
+                // TODO Ariel - Does this fetch neighbors of u in other communities?
+                // For Neighbors of u, apply function()
                 graph.forNeighborsOf(u, [&](node neighbor, edgeweight ew) {
-                    index neighborCommunity = result[neighbor];
-                    if (cutWeights[neighborCommunity] == 0) {
-                        pointers.push_back(neighborCommunity);
+                    index neighborCommunity = result[neighbor]; // Get community neighbor is in
+                    if (cutWeights[neighborCommunity] == 0) { // TODO Ariel This means u and neighbor are in same community?
+                        pointers.push_back(neighborCommunity); //TODO Ariel If so, why?
                     }
-                    if (u == neighbor) {
-                        degree += ew;
+                    if (u == neighbor) { // TODO Ariel when would u == neighbor? Doesn't make sense. Self-edge
+                        degree += ew; // Edge-weighed degree, Laplacian-like
                     } else {
-                        cutWeights[neighborCommunity] += ew;
+                        cutWeights[neighborCommunity] += ew; // Increase cross-community weight
                     }
                     degree += ew; // keep track of the nodes degree. Loops count twice
+                    // TODO Ariel why count this twice if u == neighbor?
                 });
 
                 if (pointers.empty())
-                    continue;
+                    continue; // TODO Ariel ??
 
                 // Determine Modularity delta for all neighbor communities
-                for (auto community : pointers) {
+                // TODO Ariel why isn't this Parallelized? I assume bcs. line 140? Ask Randal
+                for (auto community : pointers) { // Ariel-Apparently CutWeights used in Modularity calc.
                     // "Moving" a node to its current community is pointless
                     if (community != currentCommunity) {
                         double delta;
-                        delta = modularityDelta(cutWeights[community], degree,
+                        // ModularityDelta = cutWeights[community] - gamma * degree * communityVolumes[community] * inverseGraphVolume; (ParallelLeiden.h:44)
+                        // TODO Ariel What is inverseGraphVolume? Is it 1/totalWeight?
+                        delta = modularityDelta(cutWeights[community], degree, // TODO Ariel what is "degree" here?
                                                 communityVolumes[community]);
                         if (delta > maxDelta) {
                             maxDelta = delta;
